@@ -1,16 +1,16 @@
 {
   "name": "taraftar-arena-live-bridge",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.mjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19"
   },
   "dependencies": {
-    "tiktok-live-connector": "^2.5.0",
+    "piratetok-live-js": "latest",
     "ws": "^8.18.0"
   }
 }
