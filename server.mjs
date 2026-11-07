@@ -1,153 +1,104 @@
 import http from "node:http";
 import { WebSocketServer, WebSocket } from "ws";
-import { TikTokLiveConnection, WebcastEvent } from "tiktok-live-connector";
+import { TikTokLiveClient, EventType, GiftStreakTracker } from "piratetok-live-js";
 
 const PORT = Number(process.env.PORT || 10000);
 const USER = (process.env.TIKTOK_USERNAME || "arya.1027").replace(/^@/, "");
 const clients = new Set();
 const teamsByUser = new Map();
+const seenGifts = new Map();
+const giftStreaks = new GiftStreakTracker();
 
-// Gift IDs are intentionally left empty until the live gift catalog is read.
-// Configure Render env var GIFT_MAP_JSON like:
-// {"5655":{"team":"gs","points":1},"1234":{"team":"fb","points":10}}
 let giftMap = {};
-try {
-  giftMap = JSON.parse(process.env.GIFT_MAP_JSON || "{}");
-} catch {
-  console.error("[config] GIFT_MAP_JSON geçerli JSON değil; boş eşleştirme kullanılacak.");
-}
+try { giftMap = JSON.parse(process.env.GIFT_MAP_JSON || "{}"); }
+catch { console.error("[config] GIFT_MAP_JSON geçersiz; boş eşleştirme."); }
 
 let status = "starting";
-let live = null;
-let lastCatalog = [];
+let liveClient = null;
 
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    return res.end();
-  }
+  if (req.method === "OPTIONS") { res.writeHead(204); return res.end(); }
 
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  res.setHeader("content-type", "application/json; charset=utf-8");
 
-  if (url.pathname === "/health" || url.pathname === "/") {
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+  if (url.pathname === "/" || url.pathname === "/health") {
+    res.writeHead(200);
     return res.end(JSON.stringify({
-      ok: true,
-      status,
-      tiktokUsername: USER,
-      mappedGiftCount: Object.keys(giftMap).length
+      ok: true, status, tiktokUsername: USER,
+      mappedGiftCount: Object.keys(giftMap).length,
+      observedGiftCount: seenGifts.size,
+      connector: "piratetok-live-js"
     }));
   }
-
   if (url.pathname === "/api/gifts") {
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-    return res.end(JSON.stringify({
-      ok: true,
-      status,
-      gifts: lastCatalog
-    }));
+    res.writeHead(200);
+    return res.end(JSON.stringify({ ok: true, status, gifts: [...seenGifts.values()] }));
   }
-
-  res.writeHead(404, { "content-type": "application/json; charset=utf-8" });
+  res.writeHead(404);
   res.end(JSON.stringify({ ok: false, error: "Not found" }));
 });
 
 const wss = new WebSocketServer({ server, path: "/events" });
-
 wss.on("connection", ws => {
   clients.add(ws);
   ws.send(JSON.stringify({ type: "status", status, tiktokUsername: USER }));
   ws.on("close", () => clients.delete(ws));
 });
 
-function send(data) {
-  const message = JSON.stringify(data);
-  for (const ws of clients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(message);
-  }
+function broadcast(event) {
+  const payload = JSON.stringify(event);
+  for (const ws of clients) if (ws.readyState === WebSocket.OPEN) ws.send(payload);
 }
-
 function setStatus(value, detail = "") {
   status = value;
   console.log("[status]", value, detail);
-  send({ type: "status", status: value, detail });
+  broadcast({ type: "status", status, detail });
 }
+const wait = ms => new Promise(r => setTimeout(r, ms));
 
-const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
-
-function normalizeCatalog(items) {
-  if (!Array.isArray(items)) return [];
-  return items.map(g => ({
-    giftId: String(g?.id ?? g?.giftId ?? g?.gift_id ?? ""),
-    name: g?.name ?? g?.giftName ?? g?.gift_name ?? "Bilinmeyen hediye",
-    diamondCount: Number(g?.diamond_count ?? g?.diamondCount ?? g?.diamondCount ?? 0),
-    imageUrl: g?.image?.url_list?.[0] ?? g?.image?.urlList?.[0] ?? g?.imageUrl ?? null
-  })).filter(g => g.giftId);
-}
-
-async function refreshCatalog(connection) {
-  try {
-    if (Array.isArray(connection.availableGifts)) {
-      lastCatalog = normalizeCatalog(connection.availableGifts);
-    }
-    if (!lastCatalog.length && typeof connection.fetchAvailableGifts === "function") {
-      const raw = await connection.fetchAvailableGifts();
-      lastCatalog = normalizeCatalog(raw?.gifts ?? raw);
-    }
-    console.log(`[catalog] ${lastCatalog.length} hediye kataloğa alındı`);
-    send({ type: "catalog", count: lastCatalog.length });
-  } catch (error) {
-    console.error("[catalog]", error?.message || error);
-  }
-}
-
-async function run() {
-  for (;;) {
+async function connectLoop() {
+  while (true) {
     try {
       setStatus("connecting", `@${USER} yayınına bağlanılıyor`);
-      live = new TikTokLiveConnection(USER, {
-        enableExtendedGiftInfo: true,
-        processInitialData: false
-      });
+      const client = new TikTokLiveClient(USER).maxRetries(10).staleTimeout(90000);
+      liveClient = client;
 
-      live.on(WebcastEvent.CHAT, data => {
-        const username = data?.user?.uniqueId;
-        const comment = String(data?.comment || "").trim();
+      client.on(EventType.chat, data => {
+        const username = data?.user?.uniqueId || data?.user?.unique_id;
+        const comment = String(data?.content || "").trim();
         const match = comment.match(/^!tak[iı]m\s+(GS|FB|BJK|AMED|TS)$/i);
         if (!username || !match) return;
-
         const team = match[1].toUpperCase();
         teamsByUser.set(username.toLowerCase(), team);
-        send({ type: "team", username, team });
+        broadcast({ type: "team", username, team });
         console.log("[team]", username, team);
       });
 
-      live.on(WebcastEvent.GIFT, data => {
-        // Streak gifts are cumulative while being sent. Count only the final frame.
-        if (Number(data?.giftType) === 1 && data?.repeatEnd !== true) return;
-
-        const username = data?.user?.uniqueId || "unknown";
-        const giftId = String(data?.giftId ?? data?.gift?.gift_id ?? "");
-        const giftName =
-          data?.giftDetails?.giftName ||
-          data?.extendedGiftInfo?.name ||
-          data?.giftName ||
-          data?.describe ||
-          "TikTok hediyesi";
-
-        const diamonds = Number(
-          data?.diamondCount ??
-          data?.giftDetails?.diamondCount ??
-          data?.extendedGiftInfo?.diamond_count ??
-          data?.gift?.diamond_count ?? 0
-        );
+      client.on(EventType.gift, data => {
+        const gift = data?.gift || {};
+        const username = data?.user?.uniqueId || data?.user?.unique_id || "unknown";
+        const giftId = String(gift.id ?? gift.giftId ?? data?.giftId ?? "");
+        const giftName = gift.name || data?.giftName || "TikTok hediyesi";
+        const diamonds = Number(gift.diamondCount ?? gift.diamond_count ?? data?.diamondCount ?? 0);
         const repeatCount = Math.max(1, Number(data?.repeatCount || 1));
+
+        // Save every observed gift to help build the gift-ID mapping.
+        if (giftId) seenGifts.set(giftId, {
+          giftId, name: giftName, diamondCount: diamonds,
+          lastSeenAt: new Date().toISOString()
+        });
+
+        const streak = giftStreaks.process(data);
+        if (streak && streak.isFinal === false) return;
+
         const mapped = giftMap[giftId] || null;
         const chatTeam = teamsByUser.get(username.toLowerCase()) || null;
-
+        const totalDiamonds = Number(streak?.totalDiamondCount ?? diamonds * repeatCount);
+        const pointsPerGift = Number(mapped?.points ?? diamonds);
         const event = {
           type: "gift",
           username,
@@ -156,45 +107,42 @@ async function run() {
           giftName,
           diamonds,
           repeatCount,
-          totalDiamonds: diamonds * repeatCount,
+          totalDiamonds,
           team: mapped?.team || chatTeam,
-          points: mapped
-            ? Number(mapped.points ?? diamonds) * repeatCount
-            : null,
+          points: mapped ? pointsPerGift * repeatCount : null,
           mapped: Boolean(mapped),
           source: mapped ? "giftId" : (chatTeam ? "chat-command" : "unassigned")
         };
-
         console.log("[gift]", JSON.stringify(event));
-        send(event);
+        broadcast(event);
       });
 
-      live.on("connected", async () => {
-        setStatus("connected", "TikTok LIVE bağlantısı kuruldu");
-        await refreshCatalog(live);
+      client.on(EventType.connected, data => {
+        setStatus("connected", `TikTok LIVE bağlantısı kuruldu (oda: ${data?.roomId || "bilinmiyor"})`);
       });
-      live.on("disconnected", info => setStatus("disconnected", info?.reason || ""));
-      live.on("error", err => {
-        console.error("[TikTok]", err?.message || err);
-        setStatus("error", err?.message || "Bağlantı hatası");
+      client.on(EventType.disconnected, data => setStatus("disconnected", data?.reason || ""));
+      client.on(EventType.reconnecting, data => setStatus("reconnecting", JSON.stringify(data || {})));
+      client.on(EventType.error, err => {
+        const message = err?.message || String(err);
+        console.error("[TikTok]", message);
+        setStatus("error", message);
       });
 
-      await live.connect();
+      await client.connect();
       setStatus("connected", "TikTok LIVE bağlantısı kuruldu");
-      await refreshCatalog(live);
-      while (live?.isConnected) await wait(3000);
+      // Keep process alive; library manages the reconnect loop.
+      while (liveClient === client) await wait(3000);
     } catch (err) {
       console.error("[connect]", err?.message || err);
       setStatus("waiting", err?.message || "Yayın bekleniyor veya bağlantı kurulamadı");
     }
-
-    try { await live?.disconnect(); } catch {}
-    live = null;
+    try { liveClient?.disconnect(); } catch {}
+    liveClient = null;
     await wait(15000);
   }
 }
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Taraftar Arenası gift bridge listening on", PORT);
-  run();
+  console.log("Taraftar Arenası PirateTok bridge listening on", PORT);
+  connectLoop();
 });
